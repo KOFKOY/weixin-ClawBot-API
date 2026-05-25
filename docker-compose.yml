@@ -1,0 +1,13 @@
+services:
+  weixin-clawbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: weixin-clawbot
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    working_dir: /data
+    command: ["python", "/app/custom.py"]
+    volumes:
+      - ./:/data

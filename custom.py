@@ -30,7 +30,7 @@ RECONNECT_CONFIG = {
 
 # ========== 配置文件 ==========
 CONFIG_FILE = "config.json"
-_DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
+_DEFAULT_PROMPT = ""
 CHANNEL_VERSION = "2.4.3"
 ILINK_APP_ID = "bot"
 ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 3)
