@@ -31,7 +31,7 @@ class OpenAIConfig:
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-5"
     prompt: str = "你是一个有帮助的AI助手。"
-    memory_file: str = "agent_memory.txt"
+    memory_file: str = "agent_memory.ini"
     timezone: str = "Asia/Shanghai"
 
 

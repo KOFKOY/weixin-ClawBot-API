@@ -18,7 +18,7 @@ class MemoryTool:
 
     tool_name = "memory"
 
-    def __init__(self, memory_file: str = "agent_memory.txt"):
+    def __init__(self, memory_file: str = "agent_memory.ini"):
         """初始化内存存储结构与持久化目标文件路径。"""
         self.memory_file = memory_file
         self._lock = threading.Lock()
@@ -181,6 +181,7 @@ class SchedulerTool:
         self.ai_requester = ai_requester
         self.notification_queue = notification_queue
         self._tasks: dict[str, dict] = {}
+        self._restore_tasks_from_file()
 
     def create_cron_task(self, cron_expr: str, remind_text: str, user_id: str = "", task_name: str = "") -> dict:
         """创建或覆盖 cron 定时提醒任务。"""
@@ -193,15 +194,17 @@ class SchedulerTool:
             "created_at": int(time.time()),
         }
         self.scheduler.add_cron_job(task_id=task_id, cron_expr=cron_expr, func=self._execute_task, kwargs={"task_id": task_id})
+        self.scheduler.save_task(task)
         self._tasks[task_id] = task
         return task
 
     def remove_cron_task(self, task_id: str) -> dict:
         """删除指定 cron 任务。"""
-        removed = self.scheduler.remove_job(task_id)
+        removed_job = self.scheduler.remove_job(task_id)
+        removed_file = self.scheduler.delete_task(task_id)
         if task_id in self._tasks:
             del self._tasks[task_id]
-        return {"task_id": task_id, "removed": bool(removed)}
+        return {"task_id": task_id, "removed": bool(removed_job or removed_file)}
 
     def list_cron_tasks(self) -> list[dict]:
         """查看已创建的 cron 任务列表。"""
@@ -227,3 +230,21 @@ class SchedulerTool:
                 "created_at": int(time.time()),
             }
         )
+
+    def _restore_tasks_from_file(self):
+        """服务启动时从 ini 恢复任务并重新注册到 APScheduler。"""
+        for task in self.scheduler.load_tasks():
+            task_id = task.get("task_id", "")
+            cron_expr = task.get("cron_expr", "")
+            if not task_id or not cron_expr:
+                continue
+            try:
+                self.scheduler.add_cron_job(
+                    task_id=task_id,
+                    cron_expr=cron_expr,
+                    func=self._execute_task,
+                    kwargs={"task_id": task_id},
+                )
+                self._tasks[task_id] = task
+            except Exception as e:
+                print(f"[WARN] 恢复定时任务失败 task_id={task_id}: {e}")
