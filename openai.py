@@ -29,7 +29,7 @@ class OpenAIConfig:
 
     api_key: str
     base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-5"
+    model: str = "gpt-5.4"
     prompt: str = "你是一个有帮助的AI助手。"
     memory_file: str = "agent_memory.ini"
     timezone: str = "Asia/Shanghai"
@@ -99,9 +99,7 @@ class OpenAIAPI:
         payload = {
             "model": target_model,
             "messages": messages,
-            "max_tokens": 1024,
             "stream": False,
-            "temperature": 0.1,
             "reasoning_effort": "high",
         }
         endpoint = f"{self.base_url}/chat/completions"
