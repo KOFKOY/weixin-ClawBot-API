@@ -87,6 +87,16 @@ class OpenAIAPI:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
         return messages
+    
+
+    def repeat_str(s: str) -> str:
+        import re
+        s = s.replace('```', '').strip()
+        s = re.sub(r'}\s+{', '}{', s)
+        n = len(s)
+        if n % 2 == 0 and s[:n//2].strip() == s[n//2:].strip(): 
+            return s[:n//2].strip()
+        return s
 
     def request_ai(self, messages: list[dict], model: str | None = None) -> str:
         """统一 OpenAI 请求封装，便于 chat 与定时任务复用。"""
@@ -118,6 +128,7 @@ class OpenAIAPI:
                     if attempt > 0:
                         log(f"OpenAIAPI 第 {attempt} 次重试成功：{content[:100]}...")
                     else:
+                        content = self.repeat_str(content)
                         log(f"OpenAIAPI 返回成功：{content[:100]}...")
                     return content
                 return "AI 未返回有效内容"
