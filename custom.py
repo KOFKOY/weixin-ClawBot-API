@@ -412,6 +412,10 @@ async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_co
             except asyncio.TimeoutError:
                 # 定时到，重新评估
                 remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+                # 说明会话已被手动/自动重连刷新，退出本轮提醒循环，按新会话重新计时。
+                if remaining > cfg["warning_before"] or not warning_active[0]:
+                    warning_active[0] = False
+                    break
                 if remaining <= cfg["force_before"]:
                     continue  # 下一轮循环走强制重连分支
                 remaining_m = remaining / 60
