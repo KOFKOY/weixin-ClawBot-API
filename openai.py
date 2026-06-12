@@ -20,7 +20,8 @@ version = "1.0.3"
 
 def log(message, level="INFO"):
     """统一日志输出。"""
-    print(f"[{level}] {message}")
+    # print(f"[{level}] {message}")
+    pass
 
 
 @dataclass

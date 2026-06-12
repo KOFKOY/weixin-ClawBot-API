@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import builtins
 import io
 import json
 import os
@@ -14,6 +15,13 @@ from openai import OpenAIAPI, OpenAIConfig
 
 executor = ThreadPoolExecutor(max_workers=4)
 ai = None  # 启动时从配置文件加载后初始化
+
+
+def _silent_print(*args, **kwargs):
+    return
+
+
+print = _silent_print
 
 # ========== 自动重连配置（可调参数） ==========
 # 测试时将数值改小，例如：
@@ -306,7 +314,7 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
 
     # 发送二维码给用户（失败时控制台打印）
     qr_msg = f"[重连] 请扫码完成新连接：{qrcode_url}"
-    print(qr_msg)
+    builtins.print(qr_msg)
     render_terminal_qr(qrcode_url)
     await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
 
@@ -431,7 +439,7 @@ def render_terminal_qr(content: str):
     """在终端渲染二维码，优先使用远程图片内容。"""
     if not content:
         return
-    print("\n扫码地址:", content)
+    builtins.print("\n扫码地址:", content)
     if content.startswith("http") and render_terminal_image_from_url(content):
         return
     render_generated_qr(content)
@@ -454,13 +462,13 @@ def render_terminal_image_from_url(url: str) -> bool:
         width = max(1, int(image.width / scale))
         height = max(1, int(image.height / scale))
         image = image.resize((width, height))
-        print()
+        builtins.print()
         for y in range(height):
-            print("".join("██" if image.getpixel((x, y)) < 128 else "  " for x in range(width)))
-        print()
+            builtins.print("".join("██" if image.getpixel((x, y)) < 128 else "  " for x in range(width)))
+        builtins.print()
         return True
     except Exception as e:
-        print(f"二维码图片渲染失败，改用本地二维码生成方式: {e}")
+        builtins.print(f"二维码图片渲染失败，改用本地二维码生成方式: {e}")
         return False
 
 
@@ -469,17 +477,17 @@ def render_generated_qr(content: str):
     try:
         import qrcode
     except ImportError:
-        print("未安装 qrcode/Pillow，无法在终端渲染二维码；安装 `pip install qrcode pillow` 后会自动显示。")
+        builtins.print("未安装 qrcode/Pillow，无法在终端渲染二维码；安装 `pip install qrcode pillow` 后会自动显示。")
         return
 
     qr = qrcode.QRCode(version=1,border=0)
     qr.add_data(content)
     qr.make(fit=True)
     matrix = qr.get_matrix()
-    print()
+    builtins.print()
     for row in matrix:
-        print("".join("██" if cell else "  " for cell in row))
-    print()
+        builtins.print("".join("██" if cell else "  " for cell in row))
+    builtins.print()
 
 
 def save_qrcode_content(content: str):
@@ -492,18 +500,18 @@ def save_qrcode_content(content: str):
         ext = m.group(1) if m else "png"
         with open(f"qrcode.{ext}", "wb") as f:
             f.write(base64.b64decode(b64))
-        print(f"二维码已保存到 qrcode.{ext}")
+        builtins.print(f"二维码已保存到 qrcode.{ext}")
     elif content.startswith("<svg"):
         with open("qrcode.svg", "w", encoding="utf-8") as f:
             f.write(content)
-        print("二维码已保存到 qrcode.svg，用浏览器打开")
+        builtins.print("二维码已保存到 qrcode.svg，用浏览器打开")
     elif content.startswith("http"):
         render_terminal_qr(content)
     else:
         try:
             with open("qrcode.png", "wb") as f:
                 f.write(base64.b64decode(content))
-            print("二维码已保存到 qrcode.png")
+            builtins.print("二维码已保存到 qrcode.png")
         except Exception:
             render_terminal_qr(content)
 
@@ -611,21 +619,21 @@ async def login_with_qrcode(session, base_url=BASE_URL):
         qrcode = data["qrcode"]
         qrcode_img_content = data.get("qrcode_img_content", "")
 
-        print("qrcode:", qrcode)
+        builtins.print("qrcode:", qrcode)
         save_qrcode_content(str(qrcode_img_content or qrcode))
-        print("等待扫码...")
+        builtins.print("等待扫码...")
 
         login_result = await wait_login_confirmation(session, qrcode, base_url)
         if login_result.get("bot_token"):
             return login_result
         if login_result.get("already_connected"):
-            print("服务端提示此端已连接过，但当前独立程序没有可复用 token，将重新生成二维码。")
+            builtins.print("服务端提示此端已连接过，但当前独立程序没有可复用 token，将重新生成二维码。")
         elif login_result.get("expired"):
-            print("二维码已过期，正在重新生成...")
+            builtins.print("二维码已过期，正在重新生成...")
         elif login_result.get("verify_code_blocked"):
-            print("多次输入配对码错误，正在刷新二维码...")
+            builtins.print("多次输入配对码错误，正在刷新二维码...")
         elif login_result.get("timeout"):
-            print("登录等待超时，正在重新生成二维码...")
+            builtins.print("登录等待超时，正在重新生成二维码...")
 
         refresh_count += 1
         if refresh_count >= max_refresh_count:
