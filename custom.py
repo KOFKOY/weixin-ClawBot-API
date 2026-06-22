@@ -858,6 +858,7 @@ ai = OpenAIAPI(OpenAIConfig(
         base_url=_raw_cfg["base_url"],
         model=_raw_cfg["model"],
         prompt=_raw_cfg["prompt"],
+        type=_raw_cfg.get("type", "chat"),
     ))
 
 asyncio.run(main())

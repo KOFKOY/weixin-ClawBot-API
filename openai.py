@@ -34,6 +34,7 @@ class OpenAIConfig:
     prompt: str = "你是一个有帮助的AI助手。"
     memory_file: str = "agent_memory.ini"
     timezone: str = "Asia/Shanghai"
+    type: str = "chat"
 
 
 class OpenAIAPI:
@@ -45,6 +46,7 @@ class OpenAIAPI:
         self.api_key = config.api_key
         self.base_url = config.base_url.rstrip("/")
         self.model = config.model
+        self.request_type = (config.type or "chat").strip().lower()
         self._notification_queue: queue.Queue = queue.Queue()
 
         # 工具层初始化：记忆工具 + 定时任务工具。
@@ -90,8 +92,8 @@ class OpenAIAPI:
         return messages
     
 
+    @staticmethod
     def repeat_str(s: str) -> str:
-        import re
         s = s.replace('```', '').strip()
         s = re.sub(r'}\s+{', '}{', s)
         n = len(s)
@@ -99,21 +101,73 @@ class OpenAIAPI:
             return s[:n//2].strip()
         return s
 
+    def _build_responses_payload(self, target_model: str, messages: list[dict]) -> dict:
+        """构造 Responses API 请求体。"""
+        instructions = None
+        input_items: list[dict] = []
+        for msg in messages:
+            role = str(msg.get("role", "user"))
+            content = str(msg.get("content", ""))
+            if role == "system" and instructions is None:
+                instructions = content
+                continue
+            input_items.append({"role": role, "content": content})
+
+        payload: dict[str, Any] = {
+            "model": target_model,
+            "input": input_items,
+            "reasoning": {"effort": "high"},
+        }
+        if instructions:
+            payload["instructions"] = instructions
+        return payload
+
+    def _extract_response_text(self, data: dict) -> str:
+        """从 Responses API 返回结构中提取文本。"""
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        text_parts: list[str] = []
+        for item in data.get("output", []):
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") in {"output_text", "text"}:
+                    text = content.get("text") or content.get("value") or ""
+                    if text:
+                        text_parts.append(str(text))
+        if text_parts:
+            return "".join(text_parts).strip()
+
+        # 兼容部分 OpenAI-compatible 网关返回 chat/completions 格式。
+        try:
+            return data["choices"][0]["message"].get("content", "")
+        except Exception:
+            return ""
+
     def request_ai(self, messages: list[dict], model: str | None = None) -> str:
         """统一 OpenAI 请求封装，便于 chat 与定时任务复用。"""
         target_model = model or self.model
+        use_chat_completions = self.request_type == "chat"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "User-Agent": f"siver-weixin_clawbot-api/{version}",
         }
-        payload = {
-            "model": target_model,
-            "messages": messages,
-            "stream": False,
-            "reasoning_effort": "high",
-        }
-        endpoint = f"{self.base_url}/chat/completions"
+        if use_chat_completions:
+            payload = {
+                "model": target_model,
+                "messages": messages,
+                "stream": False,
+                "reasoning_effort": "high",
+            }
+            endpoint = f"{self.base_url}/chat/completions"
+        else:
+            payload = self._build_responses_payload(target_model=target_model, messages=messages)
+            endpoint = f"{self.base_url}/responses"
 
         retry_delays = [2, 4, 8, 16, 32]
         max_retries = 5
@@ -124,7 +178,10 @@ class OpenAIAPI:
                 response = requests.post(endpoint, headers=headers, json=payload, timeout=60)
                 response.raise_for_status()
                 data = response.json()
-                content = data["choices"][0]["message"].get("content", "")
+                if use_chat_completions:
+                    content = data["choices"][0]["message"].get("content", "")
+                else:
+                    content = self._extract_response_text(data)
                 if content:
                     if attempt > 0:
                         log(f"OpenAIAPI 第 {attempt} 次重试成功：{content[:100]}...")
