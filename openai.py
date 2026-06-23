@@ -270,6 +270,7 @@ class OpenAIAPI:
             "14) 输出必须满足下方 JSON Schema（Draft 2020-12）。\n"
             "15) action 为 null 表示本轮不调用工具；action 非 null 时只允许一个工具调用。\n"
             "16) 每轮只返回一个 JSON 对象，且必须符合 schema。\n"
+            "17) 执行删除任务操作时，先获取全部定时任务，匹配一条最相关的任务删除\n"
             "Response JSON Schema:\n"
             f"{schema_text}"
         )
