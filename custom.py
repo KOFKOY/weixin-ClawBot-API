@@ -6,6 +6,8 @@ import json
 import os
 import random
 import re
+from dataclasses import dataclass, field
+from enum import Enum
 import aiohttp
 import time
 import urllib.request
@@ -29,8 +31,8 @@ print = _silent_print
 #   "force_before": 60, "qrcode_scan_timeout": 120
 RECONNECT_CONFIG = {
     "session_duration":    24 * 3600,  # 会话总时长（秒）
-    "warning_before":       2 * 3600,  # 提前多久发出警告（秒）
-    "reminder_interval":      30 * 60, # 用户回 N 后多久再问（秒）
+    "warning_before":       2 * 3600,  # 提前多久开始自动下发重连地址（秒）
+    "reminder_interval":      30 * 60, # 重连失败后的重试间隔（秒）
     "force_before":           30 * 60, # 最后多久强制重连（秒）
     "qrcode_scan_timeout":       600,  # 等待用户扫码最长时间（秒）
 }
@@ -43,6 +45,7 @@ CHANNEL_VERSION = "2.4.3"
 ILINK_APP_ID = "bot"
 ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 3)
 BOT_AGENT = "weixin-ClawBot-API/1.0.1 (python)"
+WEBHOOK_NOTIFY_URL = "https://wx.kofkoy.de5.net/webhook"
 
 PROVIDERS = {
     "dusapi": {
@@ -205,7 +208,7 @@ COMMANDS_MSG = (
     "可用指令：\n"
     "/help  /指令   - 查看全部指令列表\n"
     "/time          - 查询当前连接剩余时间\n"
-    "/重新连接       - 立即触发重新连接（需确认）\n"
+    "/重新连接       - 立即触发重新连接（直接下发重连地址）\n"
     "\n非指令输入即为 AI 对话"
 )
 
@@ -233,6 +236,32 @@ def base_info():
     }
 
 
+class SessionState(str, Enum):
+    """连接状态机状态。"""
+    ACTIVE = "ACTIVE"
+    RECONNECTING = "RECONNECTING"
+
+
+@dataclass
+class RuntimeState:
+    """统一管理运行期可变状态，避免大量 list/dict 引用透传。"""
+    bot_token: str
+    bot_base_url: str = ""
+    login_time: float = field(default_factory=time.time)
+    state: SessionState = SessionState.ACTIVE
+    last_contact_from_id: str | None = None
+    last_contact_context_token: str | None = None
+    typing_ticket_cache: dict = field(default_factory=dict)
+    context_token_cache: dict = field(default_factory=dict)
+    welcomed_users: set = field(default_factory=set)
+
+    def remaining_seconds(self, cfg: dict) -> float:
+        return max(0.0, self.login_time + cfg["session_duration"] - time.time())
+
+    def current_base_url(self) -> str:
+        return self.bot_base_url or BASE_URL
+
+
 async def api_get(session, path, token=None, base_url=None):
     """统一封装 GET 请求，打印响应并尽量解析为 JSON。"""
     url = f"{base_url or BASE_URL}/{path}"
@@ -240,9 +269,12 @@ async def api_get(session, path, token=None, base_url=None):
         text = await res.text()
         print(f"  [GET {path}] HTTP {res.status} → {text[:200]}")
         try:
-            return json.loads(text)
+            data = json.loads(text)
+            if isinstance(data, dict):
+                data.setdefault("_http_status", res.status)
+            return data
         except Exception:
-            return {}
+            return {"_http_status": res.status, "_raw_text": text}
 
 
 async def api_post(session, path, body, token=None, base_url=None):
@@ -253,19 +285,36 @@ async def api_post(session, path, body, token=None, base_url=None):
         print(f"  [{path}] HTTP {res.status} → {text[:200]}")
         try:
             import json
-            return json.loads(text)
+            data = json.loads(text)
+            if isinstance(data, dict):
+                data.setdefault("_http_status", res.status)
+            return data
         except Exception:
-            return {}
+            return {"_http_status": res.status, "_raw_text": text}
 
 
-async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_base_url_ref):
-    """发送微信消息，失败时降级为控制台打印，不抛异常。"""
+def _is_send_result_ok(result: dict) -> bool:
+    """兼容多种返回结构，尽量判断 sendmessage 是否成功。"""
+    if not isinstance(result, dict):
+        return False
+    status = result.get("_http_status")
+    if status is not None and int(status) >= 400:
+        return False
+    for key in ("errcode", "code", "retcode", "ret"):
+        value = result.get(key)
+        if value not in (None, 0, "0", 200, "200", "ok", "OK"):
+            return False
+    return True
+
+
+async def send_msg_safe(session, to_id, context_token, text, bot_token, bot_base_url) -> bool:
+    """发送微信消息，失败时返回 False，不抛异常。"""
     if not to_id or not context_token:
-        print(f"[重连通知] {text}")
-        return
+        print(f"[发送失败] 缺少 to_id/context_token，消息内容: {text}")
+        return False
     try:
         client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
-        await api_post(
+        result = await api_post(
             session,
             "ilink/bot/sendmessage",
             {
@@ -280,159 +329,163 @@ async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_
                 },
                 "base_info": base_info(),
             },
-            bot_token_ref[0],
-            bot_base_url_ref[0] or None,
+            bot_token,
+            bot_base_url or None,
         )
+        return _is_send_result_ok(result)
     except Exception as e:
-        print(f"[重连通知] 发送失败({e})，降级打印: {text}")
+        print(f"[发送失败] sendmessage 异常({e})，消息内容: {text}")
+        return False
 
 
-async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                       typing_ticket_cache, reconnect_asked, warning_active,
-                       reconnect_in_progress, login_time_ref, cfg):
-    """执行重连流程。防重入，失败时优雅降级，成功后原子替换 token。"""
-    if reconnect_in_progress[0]:
-        return
-    reconnect_in_progress[0] = True
-    warning_active[0] = False
-    reconnect_asked.clear()
-
-    print("[重连] 开始重连流程...")
-    from_id = last_contact["from_id"]
-    ctx = last_contact["context_token"]
-
-    _base = bot_base_url_ref[0] or BASE_URL
+async def notify_webhook(session, final_msg: str) -> bool:
+    """发送兜底 webhook 通知。"""
+    url = f"{WEBHOOK_NOTIFY_URL}?msg={quote(final_msg, safe='')}"
     try:
-        data = await fetch_login_qrcode(session, _base, [bot_token_ref[0]] if bot_token_ref[0] else [])
-        qrcode = data["qrcode"]
-        qrcode_url = data.get("qrcode_img_content", qrcode)
+        async with session.get(url) as res:
+            await res.text()
+            return 200 <= res.status < 300
     except Exception as e:
-        print(f"[重连] 获取二维码失败: {e}")
-        reconnect_in_progress[0] = False
-        login_time_ref[0] = time.time()
-        return
+        print(f"[Webhook] 通知失败: {e}")
+        return False
 
-    # 发送二维码给用户（失败时控制台打印）
-    qr_msg = f"[重连] 请扫码完成新连接：{qrcode_url}"
-    builtins.print(qr_msg)
-    render_terminal_qr(qrcode_url)
-    await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
 
-    # 轮询扫码状态（带超时）
-    login_result = await wait_login_confirmation(
-        session,
-        qrcode,
-        _base,
-        timeout_seconds=cfg["qrcode_scan_timeout"],
-        allow_already_connected=True,
-    )
-    if login_result.get("already_connected"):
-        print("[重连] 服务端提示已连接过此 OpenClaw，继续沿用当前连接")
-        new_token = bot_token_ref[0]
-        new_base_url = bot_base_url_ref[0]
-    else:
+def extract_qrcode_address(data: dict) -> str:
+    """优先提取可直接访问的二维码地址。"""
+    qrcode = str(data.get("qrcode", ""))
+    qrcode_img_content = str(data.get("qrcode_img_content", ""))
+    for candidate in (qrcode, qrcode_img_content):
+        if candidate.startswith("http"):
+            return candidate
+    return qrcode or qrcode_img_content
+
+
+class ReconnectStateMachine:
+    """连接重连状态机：ACTIVE -> RECONNECTING -> ACTIVE。"""
+
+    def __init__(self, runtime: RuntimeState, cfg: dict):
+        self.runtime = runtime
+        self.cfg = cfg
+        self._lock = asyncio.Lock()
+        self.next_retry_at = 0.0
+
+    def remaining_seconds(self) -> float:
+        return self.runtime.remaining_seconds(self.cfg)
+
+    def should_auto_reconnect(self) -> bool:
+        if self.runtime.state != SessionState.ACTIVE:
+            return False
+        if time.time() < self.next_retry_at:
+            return False
+        return self.remaining_seconds() <= self.cfg["warning_before"]
+
+    def _schedule_retry(self, delay_seconds: float):
+        self.next_retry_at = time.time() + max(5.0, float(delay_seconds))
+
+    async def trigger(self, session, reason: str) -> bool:
+        if self._lock.locked():
+            return False
+        async with self._lock:
+            self.runtime.state = SessionState.RECONNECTING
+            success = await self._run_reconnect_flow(session, reason)
+            self.runtime.state = SessionState.ACTIVE
+            if success:
+                self.next_retry_at = 0.0
+            return success
+
+    async def _run_reconnect_flow(self, session, reason: str) -> bool:
+        current_base = self.runtime.current_base_url()
+        local_token_list = [self.runtime.bot_token] if self.runtime.bot_token else []
+
+        try:
+            data = await fetch_login_qrcode(session, current_base, local_token_list)
+        except Exception as e:
+            print(f"[重连] 获取二维码失败: {e}")
+            self._schedule_retry(self.cfg["reminder_interval"])
+            return False
+
+        qrcode = data.get("qrcode")
+        if not qrcode:
+            print("[重连] 未获取到 qrcode 字段")
+            self._schedule_retry(self.cfg["reminder_interval"])
+            return False
+
+        address = extract_qrcode_address(data)
+        remaining_m = self.remaining_seconds() / 60
+        final_msg = (
+            f"[重连-{reason}] 连接剩余约 {remaining_m:.0f} 分钟，"
+            f"请直接打开地址完成重连：{address}"
+        )
+
+        sent = await send_msg_safe(
+            session,
+            self.runtime.last_contact_from_id,
+            self.runtime.last_contact_context_token,
+            final_msg,
+            self.runtime.bot_token,
+            self.runtime.bot_base_url,
+        )
+        if not sent:
+            await notify_webhook(session, final_msg)
+
+        login_result = await wait_login_confirmation(
+            session,
+            qrcode,
+            current_base,
+            timeout_seconds=self.cfg["qrcode_scan_timeout"],
+            allow_already_connected=True,
+        )
+
+        if login_result.get("already_connected"):
+            self.runtime.login_time = time.time()
+            await send_msg_safe(
+                session,
+                self.runtime.last_contact_from_id,
+                self.runtime.last_contact_context_token,
+                "[重连] 服务端提示连接已有效，继续使用当前连接。",
+                self.runtime.bot_token,
+                self.runtime.bot_base_url,
+            )
+            return True
+
         new_token = login_result.get("bot_token")
-        new_base_url = login_result.get("baseurl", bot_base_url_ref[0])
+        if not new_token:
+            fail_msg = "[重连失败] 扫码超时或未确认，稍后会再次发送重连地址。"
+            sent_fail = await send_msg_safe(
+                session,
+                self.runtime.last_contact_from_id,
+                self.runtime.last_contact_context_token,
+                fail_msg,
+                self.runtime.bot_token,
+                self.runtime.bot_base_url,
+            )
+            if not sent_fail:
+                await notify_webhook(session, fail_msg)
+            self._schedule_retry(self.cfg["reminder_interval"])
+            return False
 
-    if new_token is None:
-        # 扫码超时：重置计时，不 crash
-        print("[重连] 扫码超时，重连未完成")
-        await send_msg_safe(session, from_id, ctx,
-                            "[失败] 扫码超时，重连未完成，下次到期前会再次提醒",
-                            bot_token_ref, bot_base_url_ref)
-        login_time_ref[0] = time.time()
-        reconnect_in_progress[0] = False
-        return
-
-    # 成功：原子替换 token 和 base_url
-    bot_token_ref[0] = new_token
-    bot_base_url_ref[0] = new_base_url
-    typing_ticket_cache.clear()
-    print("[重连] 新连接已建立，token 已切换")
-    await send_msg_safe(session, from_id, ctx,
-                        "[完成] 新连接已建立，已自动切换，继续使用",
-                        bot_token_ref, bot_base_url_ref)
-
-    reconnect_in_progress[0] = False
-    login_time_ref[0] = time.time()
+        self.runtime.bot_token = new_token
+        self.runtime.bot_base_url = login_result.get("baseurl", self.runtime.bot_base_url)
+        self.runtime.login_time = time.time()
+        self.runtime.typing_ticket_cache.clear()
+        await send_msg_safe(
+            session,
+            self.runtime.last_contact_from_id,
+            self.runtime.last_contact_context_token,
+            "[重连完成] 新连接已建立，已自动切换。",
+            self.runtime.bot_token,
+            self.runtime.bot_base_url,
+        )
+        return True
 
 
-async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                typing_ticket_cache, reconnect_asked, warning_active,
-                                reconnect_in_progress, login_time_ref, cfg):
-    """独立定时器任务，与主消息循环并发运行。"""
+async def reconnect_timer_task(session, machine: ReconnectStateMachine):
+    """独立定时器：接近到期时自动触发重连地址下发。"""
     while True:
-        # 等待到发警告的时间点
-        elapsed = time.time() - login_time_ref[0]
-        first_wait = max(0, cfg["session_duration"] - cfg["warning_before"] - elapsed)
-        await asyncio.sleep(first_wait)
-
-        # 检查剩余时间（可能因测试值设置而已超过 force_before）
-        remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-        if remaining <= cfg["force_before"]:
-            force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-            print(force_msg)
-            if not last_contact["from_id"] or not last_contact["context_token"]:
-                print("[自动] 尚无最近联系人，跳过本轮自动重连提醒")
-                login_time_ref[0] = time.time()
-                continue
-            await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                force_msg, bot_token_ref, bot_base_url_ref)
-            await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                               typing_ticket_cache, reconnect_asked, warning_active,
-                               reconnect_in_progress, login_time_ref, cfg)
-            continue
-
-        # 发初次警告
-        remaining_h = remaining / 3600
-        warn_msg = f"[提醒] 连接还剩约 {remaining_h:.1f} 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒"
-        print(warn_msg)
-        if not last_contact["from_id"] or not last_contact["context_token"]:
-            print("[提醒] 尚无最近联系人，跳过本轮连接到期提醒")
-            login_time_ref[0] = time.time()
-            continue
-        await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                            warn_msg, bot_token_ref, bot_base_url_ref)
-        warning_active[0] = True
-
-        # 询问循环
-        while True:
-            remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-            if remaining <= cfg["force_before"]:
-                force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-                print(force_msg)
-                await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                    force_msg, bot_token_ref, bot_base_url_ref)
-                await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                   typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg)
-                break
-
-            wait_secs = max(0.0, min(float(cfg["reminder_interval"]),
-                                     remaining - cfg["force_before"]))
-            try:
-                await asyncio.wait_for(reconnect_asked.wait(), timeout=wait_secs)
-                # 用户回 Y，执行重连
-                await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                   typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg)
-                break
-            except asyncio.TimeoutError:
-                # 定时到，重新评估
-                remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-                # 说明会话已被手动/自动重连刷新，退出本轮提醒循环，按新会话重新计时。
-                if remaining > cfg["warning_before"] or not warning_active[0]:
-                    warning_active[0] = False
-                    break
-                if remaining <= cfg["force_before"]:
-                    continue  # 下一轮循环走强制重连分支
-                remaining_m = remaining / 60
-                remind_msg = (f"[提醒] 连接还剩约 {remaining_m:.0f} 分钟，"
-                              f"是否现在重新连接？回复 Y 立即重连，N 继续等待")
-                print(remind_msg)
-                # 用最新的 last_contact（可能已更新）
-                await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                    remind_msg, bot_token_ref, bot_base_url_ref)
+        if machine.should_auto_reconnect():
+            reason = "自动强制" if machine.remaining_seconds() <= machine.cfg["force_before"] else "自动提醒"
+            await machine.trigger(session, reason)
+        await asyncio.sleep(5)
 
 
 def render_terminal_qr(content: str):
@@ -610,7 +663,7 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
         await asyncio.sleep(1)
 
 
-async def login_with_qrcode(session, base_url=BASE_URL):
+async def login_with_qrcode(session, base_url=BASE_URL, show_qrcode=True):
     """执行扫码登录主流程，必要时刷新二维码重试。"""
     refresh_count = 0
     max_refresh_count = 3
@@ -619,8 +672,9 @@ async def login_with_qrcode(session, base_url=BASE_URL):
         qrcode = data["qrcode"]
         qrcode_img_content = data.get("qrcode_img_content", "")
 
-        builtins.print("qrcode:", qrcode)
-        save_qrcode_content(str(qrcode_img_content or qrcode))
+        if show_qrcode:
+            builtins.print("qrcode:", qrcode)
+            save_qrcode_content(str(qrcode_img_content or qrcode))
         builtins.print("等待扫码...")
 
         login_result = await wait_login_confirmation(session, qrcode, base_url)
@@ -643,34 +697,15 @@ async def login_with_qrcode(session, base_url=BASE_URL):
 async def main():
     """程序主入口：登录、启动定时重连并循环收发消息。"""
     async with aiohttp.ClientSession() as session:
-        # 1. 获取二维码并等待扫码
-        login_result = await login_with_qrcode(session)
-        bot_token = login_result["bot_token"]
-        bot_base_url = login_result.get("baseurl", "")
-        print(f"登录成功！baseurl={bot_base_url}")
-        # print(f"{'='*40}\n{COMMANDS_MSG}\n{'='*40}")
+        login_result = await login_with_qrcode(session, show_qrcode=True)
+        runtime = RuntimeState(
+            bot_token=login_result["bot_token"],
+            bot_base_url=login_result.get("baseurl", ""),
+            login_time=time.time(),
+        )
+        machine = ReconnectStateMachine(runtime, RECONNECT_CONFIG)
+        asyncio.create_task(reconnect_timer_task(session, machine))
 
-        # 3. 共享状态（可变引用，传给定时器任务和消息循环）
-        bot_token_ref = [bot_token]
-        bot_base_url_ref = [bot_base_url]
-        last_contact = {"from_id": None, "context_token": None}
-        typing_ticket_cache = {}
-        welcomed_users = set()
-        reconnect_asked = asyncio.Event()
-        warning_active = [False]
-        reconnect_in_progress = [False]
-        login_time_ref = [time.time()]
-        manual_reconnect_pending = {}  # {from_id: True} 等待用户确认手动重连
-        context_token_cache = {}  # {from_id: context_token} 缓存最近上下文，供定时通知发送
-
-        # 4. 启动定时器任务（与消息循环并发）
-        asyncio.create_task(reconnect_timer_task(
-            session, bot_token_ref, bot_base_url_ref, last_contact,
-            typing_ticket_cache, reconnect_asked, warning_active,
-            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
-        ))
-
-        # 5. 长轮询收消息
         get_updates_buf = ""
         print("开始监听消息...")
         while True:
@@ -678,16 +713,16 @@ async def main():
                 session,
                 "ilink/bot/getupdates",
                 {"get_updates_buf": get_updates_buf, "base_info": base_info()},
-                bot_token_ref[0],
-                bot_base_url_ref[0] or None,
+                runtime.bot_token,
+                runtime.bot_base_url or None,
             )
             get_updates_buf = result.get("get_updates_buf") or get_updates_buf
 
             # OpenAI 智能体定时任务通知：从队列取出并尝试发送微信消息。
             if hasattr(ai, "drain_notifications"):
                 for notice in ai.drain_notifications(limit=20):
-                    target_user_id = notice.get("user_id") or last_contact.get("from_id")
-                    target_context_token = context_token_cache.get(target_user_id) or last_contact.get("context_token")
+                    target_user_id = notice.get("user_id") or runtime.last_contact_from_id
+                    target_context_token = runtime.context_token_cache.get(target_user_id) or runtime.last_contact_context_token
                     notice_text = notice.get("message", "")
                     if not target_user_id or not target_context_token:
                         print(f"[定时通知] 无可用会话，跳过发送: {notice_text}")
@@ -697,8 +732,8 @@ async def main():
                         target_user_id,
                         target_context_token,
                         f"[定时提醒] {notice_text}",
-                        bot_token_ref,
-                        bot_base_url_ref,
+                        runtime.bot_token,
+                        runtime.bot_base_url,
                     )
 
             for msg in result.get("msgs") or []:
@@ -708,89 +743,59 @@ async def main():
                 from_id = msg["from_user_id"]
                 context_token = msg["context_token"]
                 print(f"收到消息: {text}")
+                text_clean = text.strip()
 
-                # 更新最近联系人（定时器任务用于发通知）
-                last_contact["from_id"] = from_id
-                last_contact["context_token"] = context_token
-                context_token_cache[from_id] = context_token
+                runtime.last_contact_from_id = from_id
+                runtime.last_contact_context_token = context_token
+                runtime.context_token_cache[from_id] = context_token
 
-                # 优先级 1：手动重连 Y/N 确认（/重新连接 发出后等待回复）
-                if manual_reconnect_pending.get(from_id) and text.strip().upper() in ("Y", "N"):
-                    del manual_reconnect_pending[from_id]
-                    if text.strip().upper() == "Y":
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，正在重新连接...",
-                                            bot_token_ref, bot_base_url_ref)
-                        await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                           typing_ticket_cache, reconnect_asked, warning_active,
-                                           reconnect_in_progress, login_time_ref, RECONNECT_CONFIG)
-                    else:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "已取消重新连接",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # 优先级 2：定时预警 Y/N 处理
-                if warning_active[0] and text.strip().upper() in ("Y", "N"):
-                    if text.strip().upper() == "Y":
-                        reconnect_asked.set()
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，正在重新连接...",
-                                            bot_token_ref, bot_base_url_ref)
-                    else:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，稍后再提醒您",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # 优先级 3：首次交互，发送指令列表
-                if from_id not in welcomed_users:
-                    welcomed_users.add(from_id)
+                if from_id not in runtime.welcomed_users:
+                    runtime.welcomed_users.add(from_id)
                     # await send_msg_safe(session, from_id, context_token,
-                    #                     COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
+                    #                     COMMANDS_MSG, runtime.bot_token, runtime.bot_base_url)
                     # continue
 
                 # /help  /指令 — 返回指令列表
-                if text.strip() in ("/help", "/指令"):
+                if text_clean in ("/help", "/指令"):
                     await send_msg_safe(session, from_id, context_token,
-                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
+                                        COMMANDS_MSG, runtime.bot_token, runtime.bot_base_url)
                     continue
 
                 # /time 指令
-                if text.strip() == "/time":
-                    _rem = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
+                if text_clean == "/time":
+                    _rem = runtime.remaining_seconds(RECONNECT_CONFIG)
                     _h, _m, _s = int(_rem // 3600), int((_rem % 3600) // 60), int(_rem % 60)
                     _ts = f"{_h} 小时 {_m} 分钟" if _h > 0 else f"{_m} 分钟 {_s} 秒"
+                    _state = "重连中" if runtime.state == SessionState.RECONNECTING else "运行中"
                     await send_msg_safe(session, from_id, context_token,
-                                        f"当前连接剩余时间：{_ts}",
-                                        bot_token_ref, bot_base_url_ref)
+                                        f"当前连接状态：{_state}，剩余时间：{_ts}",
+                                        runtime.bot_token, runtime.bot_base_url)
                     continue
 
-                # /重新连接 — 手动触发重连，等待 Y/N 确认
-                if text.strip() == "/重新连接":
-                    if reconnect_in_progress[0]:
+                if text_clean == "/重新连接":
+                    if runtime.state == SessionState.RECONNECTING:
                         await send_msg_safe(session, from_id, context_token,
                                             "重连正在进行中，请稍候...",
-                                            bot_token_ref, bot_base_url_ref)
+                                            runtime.bot_token, runtime.bot_base_url)
                     else:
-                        manual_reconnect_pending[from_id] = True
                         await send_msg_safe(session, from_id, context_token,
-                                            "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
-                                            bot_token_ref, bot_base_url_ref)
+                                            "好的，正在下发重连地址...",
+                                            runtime.bot_token, runtime.bot_base_url)
+                        await machine.trigger(session, "手动")
                     continue
 
                 # getconfig 获取 typing_ticket（每个用户缓存一次）
-                if from_id not in typing_ticket_cache:
+                if from_id not in runtime.typing_ticket_cache:
                     cfg = await api_post(
                         session,
                         "ilink/bot/getconfig",
                         {"ilink_user_id": from_id, "context_token": context_token,
                          "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
+                        runtime.bot_token,
+                        runtime.bot_base_url or None,
                     )
-                    typing_ticket_cache[from_id] = cfg.get("typing_ticket", "")
-                typing_ticket = typing_ticket_cache[from_id]
+                    runtime.typing_ticket_cache[from_id] = cfg.get("typing_ticket", "")
+                typing_ticket = runtime.typing_ticket_cache[from_id]
 
                 # sendtyping status=1 表示"正在输入"
                 if typing_ticket:
@@ -799,8 +804,8 @@ async def main():
                         "ilink/bot/sendtyping",
                         {"ilink_user_id": from_id, "typing_ticket": typing_ticket,
                          "status": 1, "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
+                        runtime.bot_token,
+                        runtime.bot_base_url or None,
                     )
 
                 # 调用 AI
@@ -825,8 +830,8 @@ async def main():
                         },
                         "base_info": base_info(),
                     },
-                    bot_token_ref[0],
-                    bot_base_url_ref[0] or None,
+                    runtime.bot_token,
+                    runtime.bot_base_url or None,
                 )
                 print(f"sendmessage 返回: {send_result}")
                 print(f"已回复: {reply[:50]}...")
@@ -838,8 +843,8 @@ async def main():
                         "ilink/bot/sendtyping",
                         {"ilink_user_id": from_id, "typing_ticket": typing_ticket,
                          "status": 2, "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
+                        runtime.bot_token,
+                        runtime.bot_base_url or None,
                     )
 
 
