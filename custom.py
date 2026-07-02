@@ -212,6 +212,21 @@ COMMANDS_MSG = (
     "\n非指令输入即为 AI 对话"
 )
 
+RECONNECT_NOTICE_MARKERS = (
+    "连接还剩约",
+    "是否现在重新连接",
+    "回复 Y",
+    "N 稍后提醒",
+)
+
+
+def should_trigger_reconnect_from_notice(text: str) -> bool:
+    """识别“Y/N 确认式”的重连提醒，改为直接下发重连链接。"""
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    return all(marker in normalized for marker in RECONNECT_NOTICE_MARKERS)
+
 
 def make_headers(token=None):
     """构造调用 iLink 接口所需请求头。"""
@@ -726,6 +741,9 @@ async def main():
                     notice_text = notice.get("message", "")
                     if not target_user_id or not target_context_token:
                         print(f"[定时通知] 无可用会话，跳过发送: {notice_text}")
+                        continue
+                    if should_trigger_reconnect_from_notice(notice_text):
+                        await machine.trigger(session, "定时任务")
                         continue
                     await send_msg_safe(
                         session,
